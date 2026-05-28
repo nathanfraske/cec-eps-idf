@@ -66,6 +66,18 @@ static cec_detection_ctx_t g_detect;
 // visible from 10 kHz captured). Override via `set decim <N>`.
 #define EPS_BURST_HS_DUMP_DECIM     5
 
+// Bus voltage shutdown detector. 1 s rolling window of bus_voltage
+// samples; if (newest - oldest) drops faster than the threshold the
+// rail is collapsing - fire CEC_TRIG_SHUTDOWN (cooldown-bypassed) so
+// the rail's full collapse is captured. After firing, mute the normal
+// anomaly triggers for SHUTDOWN_MUTE_MS so cascading layer fires from
+// the collapsing rail don't spam the dump path. Parity with the
+// 24-pin's v0.5.9 v_12v rate detector.
+#define BUS_V_HIST_SIZE              SAMPLE_RATE_HZ      // 1 sec window
+#define BUS_V_SHUTDOWN_RATE_V_PER_S  (-0.5f)             // V/s, negative
+#define BUS_V_ARMED_THRESHOLD_V       5.0f               // arm once seen above
+#define SHUTDOWN_MUTE_MS              30000              // 30 s mute window
+
 // Telemetry transport - hybrid setup on the Lonely Binary N16R8 board.
 // UART USB-C (CH340K bridge) carries TelePlot output (steady telemetry
 // + burst dumps). JTAG USB-C carries CLI input / ESP_LOG / banners.
@@ -95,6 +107,62 @@ static cec_detection_ctx_t g_detect;
 #define OUTPUT_PERIOD_MS  (1000 / OUTPUT_RATE_HZ)
 #define COMMS_RATE_HZ    20
 #define COMMS_PERIOD_MS   (1000 / COMMS_RATE_HZ)
+
+// ---- Bus voltage shutdown detector helpers ----
+//
+// Rolling 1 s window of bus voltage. The detector arms once the bus
+// has been observed above BUS_V_ARMED_THRESHOLD_V (so cold-boot
+// pre-PSU-up doesn't fire) and disarms after a shutdown fires (so a
+// fully-collapsed rail doesn't re-fire on every iteration).
+// bus_shutdown_muted() gates the normal anomaly trigger path during
+// the post-shutdown window.
+
+static float    s_bus_v_hist[BUS_V_HIST_SIZE];
+static size_t   s_bus_v_hist_idx = 0;
+static size_t   s_bus_v_hist_count = 0;
+static bool     s_bus_shutdown_armed = false;
+static int64_t  s_bus_shutdown_mute_until_us = 0;
+
+static bool bus_shutdown_check(float bus_v, int64_t now_us)
+{
+    s_bus_v_hist[s_bus_v_hist_idx] = bus_v;
+    s_bus_v_hist_idx = (s_bus_v_hist_idx + 1) % BUS_V_HIST_SIZE;
+    if (s_bus_v_hist_count < BUS_V_HIST_SIZE) {
+        s_bus_v_hist_count++;
+        return false;   // need a full window before slope is meaningful
+    }
+
+    if (bus_v >= BUS_V_ARMED_THRESHOLD_V) {
+        s_bus_shutdown_armed = true;
+    }
+    if (!s_bus_shutdown_armed) return false;
+
+    /* idx now points at the about-to-be-overwritten oldest sample. */
+    float oldest = s_bus_v_hist[s_bus_v_hist_idx];
+    float slope_v_per_s = bus_v - oldest;  // window is exactly 1 s wide
+
+    if (slope_v_per_s < BUS_V_SHUTDOWN_RATE_V_PER_S) {
+        s_bus_shutdown_armed = false;  // disarm; re-arms when bus recovers above threshold
+        s_bus_shutdown_mute_until_us = now_us + (int64_t)SHUTDOWN_MUTE_MS * 1000;
+        return true;
+    }
+    return false;
+}
+
+static bool bus_shutdown_muted(int64_t now_us)
+{
+    return now_us < s_bus_shutdown_mute_until_us;
+}
+
+// ---- Load-state edge tracking ----
+//
+// Fires CEC_TRIG_STATE_CHANGE on any transition between load buckets
+// (IDLE/LIGHT/MODERATE/HEAVY/TRANSIENT). cec_capture's cooldown gate
+// throttles back-to-back transitions, so a rapidly fluctuating load
+// produces one burst per cooldown window, not one per transition.
+
+static bool             s_load_state_initialized = false;
+static cec_load_state_t s_prev_load_state;
 
 // ---- Sample task: read, convert, filter, detect, store ----
 static void sample_task(void *arg)
@@ -132,6 +200,16 @@ static void sample_task(void *arg)
         float bus_v = 0.0f;
         (void)cec_adc_read(&s_rail_12v, &bus_v); // leaves at 0 on failure
 
+        // Bus voltage shutdown detection. Bypasses cooldown so the
+        // collapse is always captured even if a recent burst is in
+        // cooldown. Also arms the post-shutdown mute window that
+        // suppresses normal anomaly triggers from the cascading rail.
+        if (bus_shutdown_check(bus_v, now_us)) {
+            esp_err_t tr = cec_capture_trigger(CEC_TRIG_SHUTDOWN);
+            ESP_LOGW(TAG, "bus shutdown detected (bus=%.2fV) - burst (%s) mute=%dms",
+                     bus_v, esp_err_to_name(tr), SHUTDOWN_MUTE_MS);
+        }
+
         // Update shared state
         if (xSemaphoreTake(g_state.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             for (int i = 0; i < CEC_NUM_CABLES; i++) {
@@ -160,12 +238,14 @@ static void sample_task(void *arg)
         };
         cec_capture_push(&cap_sample);
 
-        if (anomaly) {
+        if (anomaly && !bus_shutdown_muted(now_us)) {
             // Fire a burst capture on anomaly with the trigger reason
             // picked from the actual flags (so the burst envelope reads
             // STATIC_CRIT / ANOMALY / CURRENT_SWING rather than always
             // ANOMALY). cec_capture's busy/cooldown gates absorb
-            // back-to-back triggers; we don't gate again here.
+            // back-to-back triggers; we don't gate again here. The
+            // shutdown-mute test silences cascading detector fires
+            // from a collapsing rail in the 30 s after SHUTDOWN.
             cec_trigger_t reason = cec_trigger_for_flags(flags);
             esp_err_t tr = cec_capture_trigger(reason);
             if (tr == ESP_OK) {
@@ -179,6 +259,25 @@ static void sample_task(void *arg)
                          flags, cec_trigger_name(reason), esp_err_to_name(tr));
             }
         }
+
+        // Load state transition trigger. Cooldown gate on cec_capture
+        // throttles rapid back-to-back transitions to one burst per
+        // cooldown window, which is what we want for steady-state CPU
+        // load chatter. Suppressed during the shutdown mute window.
+        if (s_load_state_initialized
+            && load_state != s_prev_load_state
+            && !bus_shutdown_muted(now_us)) {
+            char ann[40];
+            snprintf(ann, sizeof(ann), "load %s -> %s",
+                     cec_load_state_name(s_prev_load_state),
+                     cec_load_state_name(load_state));
+            esp_err_t tr = cec_capture_trigger_with_text(CEC_TRIG_STATE_CHANGE, ann);
+            if (tr == ESP_OK) {
+                ESP_LOGI(TAG, "state change: %s", ann);
+            }
+        }
+        s_prev_load_state = load_state;
+        s_load_state_initialized = true;
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
