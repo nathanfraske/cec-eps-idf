@@ -583,15 +583,28 @@ bool swing_check(swing_detector_t *d, float current, int64_t now_us) {
 
 Longer-horizon anomaly detection.
 
-- Rolling baseline of normal current distribution per operating state
-- Flag deviations from learned baseline (e.g., current draw inconsistent with reported system state)
-- State classifier: idle / light / moderate / heavy / transient
+- Per-cable `cec_rail_profile_t` tracking running mean + std-deviation of the filtered current. Two adaptation rates: fast (0.01) for the first 100 samples after init, then a slow steady-state rate (0.0005 → ~40 s effective window at 50 Hz) once the profile is warm.
+- A profile is "warm" after `CEC_PROFILE_WARM_SAMPLES` (1000 = 20 s of dwell time at 50 Hz). Z-score returns 0 before that so anomaly detection doesn't fire during the warm-up.
+- Per-cable z-score check on every sample: `|z| > 4.0` → `CEC_FLAG_ANOMALY` → burst capture with `CEC_TRIG_ANOMALY`.
+- The classifier (idle / light / moderate / heavy / transient) reads the same profiles' `std_dev` as its noise/variability gauge.
+- Profiles are snapshotted to NVS every 5 minutes (`l3_profiles` key, magic `0xCEC50201`) and reloaded on boot, so the warm-up window isn't paid every reboot.
 
-The state classifier uses current magnitude and variance to bucket the current operating regime, which informs the baselines used by layers 1 and 2 (an overcurrent threshold for "heavy" differs from "idle").
+The state classifier uses current magnitude and the running `std_dev` to bucket the current operating regime.
 
-### Detection-to-capture trigger
+### Auto-trigger sources
 
-When any layer fires, signal the burst_task to dump the pre-trigger ring buffer plus post-trigger samples, capturing the full transient for analysis.
+`sample_task` drives `cec_capture_trigger` directly from the detection outputs. The trigger reason is picked from the actual flags by `cec_trigger_for_flags`, so the `>BURST_BEGIN` envelope carries the cause rather than always reporting `anomaly`:
+
+| Source | Flag / detector | Trigger reason | Notes |
+|---|---|---|---|
+| Layer 1 critical (overcurrent or dropout) | `CEC_FLAG_OVERCURRENT` / `CEC_FLAG_DROPOUT` | `CEC_TRIG_STATIC_CRIT` | Debounced (3 consecutive frames) |
+| Layer 2 fast transient | `CEC_FLAG_SWING` | `CEC_TRIG_CURRENT_SWING` | `\|dI/dt\| > 1 A/ms` on the raw stream |
+| Layer 3 z-score anomaly | `CEC_FLAG_ANOMALY` | `CEC_TRIG_ANOMALY` | `\|z\| > 4` once the rail profile is warm |
+| Load-state classifier edge | (transition between cec_load_state_t buckets) | `CEC_TRIG_STATE_CHANGE` | Cooldown gate throttles rapid load chatter |
+| Bus-voltage rate-of-change | 1 s window slope < −0.5 V/s | `CEC_TRIG_SHUTDOWN` | **Bypasses cooldown.** Followed by a 30 s mute window that suppresses other auto-triggers so cascading-rail noise doesn't generate spurious bursts. |
+| CLI `burst <text>` | manual | `CEC_TRIG_MANUAL` | For bench testing or operator-initiated capture |
+
+Individual layers can be silenced at runtime with `set layer1 off` (etc.) without rebuilding; the disabled layer still updates its internal state (debounce counter, EMA, rail profile) so re-enabling doesn't see stale values.
 
 ---
 
@@ -678,15 +691,13 @@ Persist calibration and config in non-volatile storage.
 
 ### Stored values
 
-| Key | Type | Description |
-|---|---|---|
-| `eps_zero_off0` | float (blob) | Sensor 1 zero offset (volts) |
-| `eps_zero_off1` | float (blob) | Sensor 2 zero offset (volts) |
-| `eps_sens0` | float (blob) | Sensor 1 sensitivity (V/A), if span-calibrated |
-| `eps_sens1` | float (blob) | Sensor 2 sensitivity (V/A) |
-| `module_id` | uint8 | Module instance ID |
-| `oc_threshold` | float | Overcurrent threshold (A) |
-| `ema_alpha` | float | Filter responsiveness |
+All blobs go through the `cec_nvs` wrapper which prefixes each payload with a 4-byte magic. A firmware revision that changes the payload layout bumps the magic; the load path then rejects the stale blob cleanly with `ESP_ERR_INVALID_VERSION` instead of feeding garbage into the new struct.
+
+| Key | Magic | Payload | Description |
+|---|---|---|---|
+| `config` | `0xCEC50002` | `cec_config_t` | module_id, supply_voltage, oc_threshold, ema_alpha, output_raw, layer1/2/3_enabled |
+| `zero_off0` / `zero_off1` | `0xCEC50101` | float | Per-sensor ACS758 zero offset (volts at chip output) |
+| `l3_profiles` | `0xCEC50201` | `cec_rail_profile_t[CEC_NUM_CABLES]` | Layer 3 learned baselines (mean + std + sample_count per cable). Snapshotted every 5 minutes by `sample_task`; loaded once at boot. |
 
 ### Access pattern
 
@@ -731,18 +742,24 @@ if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 
 ## Serial Command Interface
 
-Simple line-based command parser over the USB serial console for development control.
+Line-based command parser over the USB Serial-JTAG console for development control. CR / CRLF / LF line endings all work.
 
 | Command | Action |
 |---|---|
 | `cal` | Run zero-offset calibration (ensure no load first) |
 | `cal span <I>` | Span calibration with known current `I` amps |
-| `show` | Print current readings and config |
-| `set alpha <v>` | Set EMA alpha |
+| `show` | Print currents, calibration, config, layer enables, burst params |
+| `set alpha <v>` | Set EMA alpha (in-memory; `save` to persist) |
 | `set oc <A>` | Set overcurrent threshold |
-| `save` | Persist config to NVS |
-| `reset` | Reset config to defaults |
-| `mode raw` / `mode filt` | Switch telemetry between raw and filtered |
+| `set supply <V>` | Set measured ACS758 Vcc (re-applies ratiometric scaling + capture cal snapshot) |
+| `set decim <N>` | HS dump decimation: emit every Nth row of the 10 kHz capture (runtime-only, not persisted) |
+| `set layer1 on/off` | Toggle Layer 1 (current threshold) contribution to flags |
+| `set layer2 on/off` | Toggle Layer 2 (dI/dt swing) contribution to flags |
+| `set layer3 on/off` | Toggle Layer 3 (rail profile z-score) contribution to flags |
+| `mode raw` / `mode filt` | Telemetry emit mode |
+| `burst [<text>]` | Trigger a manual burst capture with optional annotation |
+| `can` | Print TWAI controller state + error counters + RX/bus-off counts |
+| `save` | Persist current config (including layer enables) to NVS |
 
 Implement in `command_task` reading from stdin (USB-Serial-JTAG console).
 
@@ -800,10 +817,15 @@ Firmware bring-up after the hardware passes its power-on tests:
 - [ ] Apply a known current (bench supply through one sensor) and confirm the reading matches within a few percent
 - [ ] Confirm filter reduces noise to ~10-30 mA RMS
 - [ ] Verify swing detector fires on a fast load step
-- [ ] Teleplot output renders both current channels live
-- [ ] CAN driver installs and transmits in loopback mode
-- [ ] NVS save/load round-trips calibration correctly
-- [ ] Serial commands respond
+- [ ] Teleplot output renders both current channels live (on the UART USB-C, not the JTAG port)
+- [ ] CAN driver installs cleanly (`I (...) can: TWAI node up @ 125000 bps (self-test)`); flip the production TODO in `cec_can.c` to 500 kbps once moved off the Waveshare bench breakout
+- [ ] NVS save/load round-trips calibration correctly (`cal`, then `save`, then power-cycle, then `show`)
+- [ ] Layer 3 baseline persists across reboots (let it warm for 20+ s, power-cycle, confirm `show` reports load state stable rather than starting in TRANSIENT)
+- [ ] Manual `burst` from the CLI emits `>BURST_BEGIN ... >BURST_END` on the UART transport
+- [ ] Confirm auto-trigger on a real anomaly: apply a fast load step → check that a burst fires with `reason=current_swing` in the dispatcher log
+- [ ] Bus voltage tap reads close to 12 V under load (within ±5 % before trim, ±1 % after a `set supply` calibration pass)
+- [ ] Shutdown detection: kill the PSU → confirm `bus shutdown detected ...` log line and a `>BURST_BEGIN:shutdown:` envelope in the dump
+- [ ] Serial commands respond on the JTAG USB-C (CLI doesn't move to the UART transport)
 - [ ] Full EPS cable splice in place, readings track real CPU load
 
 ---
