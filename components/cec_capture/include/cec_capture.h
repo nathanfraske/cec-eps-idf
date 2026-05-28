@@ -56,23 +56,6 @@
 extern "C" {
 #endif
 
-/* Trigger sources. Names match the 24-pin's cec_trigger_t. Not every
- * source is wired on EPS yet (e.g. there's no STATE_CHANGE detector
- * here), but the enum is the shared cross-module vocabulary. */
-typedef enum {
-    CEC_TRIG_NONE = 0,
-    CEC_TRIG_MANUAL,
-    CEC_TRIG_STATIC_WARN,
-    CEC_TRIG_STATIC_CRIT,
-    CEC_TRIG_TRANSIENT,
-    CEC_TRIG_ANOMALY,
-    CEC_TRIG_STATE_CHANGE,
-    CEC_TRIG_SHUTDOWN,
-    CEC_TRIG_POWER_SWING,
-    CEC_TRIG_CURRENT_SWING,
-    CEC_TRIG_COUNT,
-} cec_trigger_t;
-
 /* Pre-trigger sample - 50 Hz, full state snapshot. */
 typedef struct {
     uint32_t ts_ms;

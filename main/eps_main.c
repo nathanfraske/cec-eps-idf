@@ -161,17 +161,22 @@ static void sample_task(void *arg)
         cec_capture_push(&cap_sample);
 
         if (anomaly) {
-            // Fire a burst capture on anomaly. cec_capture's busy/cooldown
-            // gates absorb back-to-back triggers; we don't gate again here.
-            esp_err_t tr = cec_capture_trigger(CEC_TRIG_ANOMALY);
+            // Fire a burst capture on anomaly with the trigger reason
+            // picked from the actual flags (so the burst envelope reads
+            // STATIC_CRIT / ANOMALY / CURRENT_SWING rather than always
+            // ANOMALY). cec_capture's busy/cooldown gates absorb
+            // back-to-back triggers; we don't gate again here.
+            cec_trigger_t reason = cec_trigger_for_flags(flags);
+            esp_err_t tr = cec_capture_trigger(reason);
             if (tr == ESP_OK) {
-                ESP_LOGW(TAG, "anomaly flags=0x%02x - burst triggered", flags);
+                ESP_LOGW(TAG, "flags=0x%02x reason=%s - burst triggered",
+                         flags, cec_trigger_name(reason));
             } else if (tr == ESP_ERR_NOT_FINISHED || tr == ESP_ERR_INVALID_STATE) {
-                ESP_LOGD(TAG, "anomaly flags=0x%02x - burst skipped (%s)",
-                         flags, esp_err_to_name(tr));
+                ESP_LOGD(TAG, "flags=0x%02x reason=%s - burst skipped (%s)",
+                         flags, cec_trigger_name(reason), esp_err_to_name(tr));
             } else {
-                ESP_LOGW(TAG, "anomaly flags=0x%02x - trigger failed: %s",
-                         flags, esp_err_to_name(tr));
+                ESP_LOGW(TAG, "flags=0x%02x reason=%s - trigger failed: %s",
+                         flags, cec_trigger_name(reason), esp_err_to_name(tr));
             }
         }
 

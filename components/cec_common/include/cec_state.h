@@ -11,10 +11,11 @@
 #define CEC_MODULE_TYPE_EPS 0x02
 
 // Status flag bits
-#define CEC_FLAG_OVERCURRENT  (1 << 0)
-#define CEC_FLAG_SWING        (1 << 1)
-#define CEC_FLAG_FAULT        (1 << 2)
-#define CEC_FLAG_DROPOUT      (1 << 3)
+#define CEC_FLAG_OVERCURRENT  (1 << 0)   /* Layer 1 CRITICAL on current ceiling */
+#define CEC_FLAG_SWING        (1 << 1)   /* Layer 2 fast-transient (dI/dt) */
+#define CEC_FLAG_FAULT        (1 << 2)   /* generic fault placeholder */
+#define CEC_FLAG_DROPOUT      (1 << 3)   /* Layer 1 dropout floor */
+#define CEC_FLAG_ANOMALY      (1 << 4)   /* Layer 3 z-score exceeded */
 
 // Per-cable load classifier output. The 24-pin module's cec_state_t names
 // the whole-PSU operating mode (OFF/STANDBY/...); EPS is per-cable, so
@@ -36,6 +37,25 @@ typedef enum {
     CEC_SEV_WARNING,
     CEC_SEV_CRITICAL,
 } cec_severity_t;
+
+// Burst-capture trigger reasons. Shared vocabulary across the
+// detection layers (which produce them) and cec_capture (which
+// consumes them in BURST_BEGIN headers). Parity with the 24-pin's
+// enum; some entries (e.g. STATE_CHANGE, POWER_SWING) are reserved
+// for use as the corresponding detection paths come online.
+typedef enum {
+    CEC_TRIG_NONE = 0,
+    CEC_TRIG_MANUAL,
+    CEC_TRIG_STATIC_WARN,
+    CEC_TRIG_STATIC_CRIT,
+    CEC_TRIG_TRANSIENT,
+    CEC_TRIG_ANOMALY,
+    CEC_TRIG_STATE_CHANGE,
+    CEC_TRIG_SHUTDOWN,
+    CEC_TRIG_POWER_SWING,
+    CEC_TRIG_CURRENT_SWING,
+    CEC_TRIG_COUNT,
+} cec_trigger_t;
 
 // Shared measurement state. sample_task is the only writer.
 // Readers (output, comms) take the mutex briefly to snapshot.
