@@ -27,20 +27,31 @@
  * ESP_ERR_INVALID_STATE; the main sample task is expected to skip
  * ADC-touching work while cec_capture_is_busy() is true.
  *
- * TelePlot dump format (matches the 24-pin envelope):
+ * TelePlot dump format:
  *
+ *   >burst_begin:<ts_ms>:<reason_int>    (numeric, CSV-friendly)
  *   >BURST_BEGIN:<reason>:<n_pre>_normal+<n_hs>_hs:<state>
  *   >BURST_ANNOTATION:<text>            (optional, only if trigger_with_text)
  *   >b_eps1_a:<ts_ms>:<value>           (pre-trigger samples, 50 Hz)
  *   >b_eps2_a:<ts_ms>:<value>
  *   >b_eps1_raw_a:<ts_ms>:<value>
  *   >b_eps2_raw_a:<ts_ms>:<value>
+ *   >b_bus_v:<ts_ms>:<value>
  *   >b_temp_c:<ts_ms>:<value>
  *   >b_load:<ts_ms>:<value>
  *   >b_flags:<ts_ms>:<value>
  *   >hs_eps1_a:<ts_us_offset>:<value>   (HS samples, 10 kHz)
  *   >hs_eps2_a:<ts_us_offset>:<value>
+ *   >burst_end:<ts_ms>:0                 (numeric, CSV-friendly)
  *   >BURST_END
+ *
+ * The lowercase >burst_begin / >burst_end lines carry numeric values
+ * (reason_int from cec_trigger_t for begin, 0 for end) so they survive
+ * TelePlot's CSV export and produce step pulses that bracket each burst
+ * in CSV analysis. The uppercase >BURST_BEGIN / >BURST_ANNOTATION /
+ * >BURST_END lines are kept for raw-stream consumption (idf.py monitor
+ * and the 24-pin's capture-analysis tooling that already parses that
+ * format).
  */
 
 #pragma once

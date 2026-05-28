@@ -593,7 +593,7 @@ The state classifier uses current magnitude and the running `std_dev` to bucket 
 
 ### Auto-trigger sources
 
-`sample_task` drives `cec_capture_trigger` directly from the detection outputs. The trigger reason is picked from the actual flags by `cec_trigger_for_flags`, so the `>BURST_BEGIN` envelope carries the cause rather than always reporting `anomaly`:
+`sample_task` drives `cec_capture_trigger` directly from the detection outputs. The trigger reason is picked from the actual flags by `cec_trigger_for_flags`, so the `>BURST_BEGIN` envelope carries the cause rather than always reporting `anomaly`. Each burst also emits a `>burst_begin:<ts_ms>:<reason_int>` and `>burst_end:<ts_ms>:0` pair with numeric values so the envelope survives TelePlot's CSV exporter (the human-readable `>BURST_BEGIN` line gets dropped on CSV save because its value field is a name, not a number):
 
 | Source | Flag / detector | Trigger reason | Notes |
 |---|---|---|---|

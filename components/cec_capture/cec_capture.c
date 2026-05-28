@@ -271,6 +271,21 @@ static void dump_burst(cec_trigger_t reason, const char *annotation,
     char chunk[384];
     int  n;
 
+    /* TelePlot CSV exporter drops rows whose value field isn't numeric,
+     * so the human-readable >BURST_BEGIN line below (3 colons + a name
+     * like "anomaly" in the value slot) doesn't survive a CSV save.
+     * Emit a parallel numeric series first - >burst_begin:<ts>:<reason>
+     * with reason as the cec_trigger_t int (1..9) so each burst plots
+     * as a step pulse the analysis tooling can latch onto. >burst_end
+     * uses value 0 to differentiate the closing marker. */
+    uint32_t begin_ts_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    n = snprintf(chunk, sizeof(chunk),
+                 ">burst_begin:%" PRIu32 ":%u\n",
+                 begin_ts_ms, (unsigned)reason);
+    if (n > 0) teleplot_write_raw(chunk, (size_t)n);
+
+    /* Human-readable envelope for raw-stream consumers (idf.py monitor,
+     * the 24-pin's capture-analysis tooling). Kept as-is for parity. */
     n = snprintf(chunk, sizeof(chunk),
                  ">BURST_BEGIN:%s:%u_normal+%u_hs:cap\n",
                  cec_trigger_name(reason),
@@ -324,6 +339,15 @@ static void dump_burst(cec_trigger_t reason, const char *annotation,
             vTaskDelay(1);
         }
     }
+
+    /* CSV-friendly numeric end marker, paired with >burst_begin above.
+     * Value 0 distinguishes "end" from the reason int that >burst_begin
+     * emits (1..9). Plotted together the two series produce a step
+     * pulse that brackets each burst in TelePlot's CSV. */
+    uint32_t end_ts_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    n = snprintf(chunk, sizeof(chunk),
+                 ">burst_end:%" PRIu32 ":0\n", end_ts_ms);
+    if (n > 0) teleplot_write_raw(chunk, (size_t)n);
 
     n = snprintf(chunk, sizeof(chunk), ">BURST_END\n");
     if (n > 0) teleplot_write_raw(chunk, (size_t)n);
