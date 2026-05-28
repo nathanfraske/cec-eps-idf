@@ -537,7 +537,7 @@ static int cmd_mode(int argc, char **argv)
 static const cec_cli_command_t CLI_COMMANDS[] = {
     { "show",  "print current readings, calibration, and config",       cmd_show  },
     { "cal",   "zero-offset cal on both sensors, or 'cal span <amps>'", cmd_cal   },
-    { "set",   "set <alpha|oc|supply|decim> <value> (decim is runtime-only)", cmd_set },
+    { "set",   "set <alpha|oc|supply|decim|layer1|layer2|layer3> <val>",     cmd_set },
     { "save",  "persist current config to NVS",                         cmd_save  },
     { "mode",  "set telemetry mode: 'mode raw' or 'mode filt'",         cmd_mode  },
     { "burst", "trigger a manual burst capture ('burst <annotation>')", cmd_burst },
