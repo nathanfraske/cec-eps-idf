@@ -77,6 +77,9 @@ typedef struct {
     float oc_threshold_a;       // overcurrent threshold per cable
     float ema_alpha;            // filter responsiveness
     bool output_raw;            // telemetry mode: raw vs filtered
+    bool layer1_enabled;        // detection layer 1 (current threshold)
+    bool layer2_enabled;        // detection layer 2 (dI/dt swing)
+    bool layer3_enabled;        // detection layer 3 (rail profile / z-score)
 } cec_config_t;
 
 // Defaults (used when NVS is empty)

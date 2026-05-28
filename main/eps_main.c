@@ -164,6 +164,16 @@ static bool bus_shutdown_muted(int64_t now_us)
 static bool             s_load_state_initialized = false;
 static cec_load_state_t s_prev_load_state;
 
+// ---- Layer 3 NVS persistence cadence ----
+//
+// Snapshot the per-cable rail profiles to NVS every L3_NVS_SAVE_PERIOD
+// so the learned baseline survives reboots. 5 min is the 24-pin's
+// v0.5.9 cadence; the writes are small (one blob of CEC_NUM_CABLES *
+// sizeof(cec_rail_profile_t) bytes) so the NVS wear is negligible.
+
+#define L3_NVS_SAVE_PERIOD_US  (5LL * 60 * 1000 * 1000)
+static int64_t s_l3_last_save_us = 0;
+
 // ---- Sample task: read, convert, filter, detect, store ----
 static void sample_task(void *arg)
 {
@@ -279,6 +289,13 @@ static void sample_task(void *arg)
         s_prev_load_state = load_state;
         s_load_state_initialized = true;
 
+        // Periodic NVS snapshot of the Layer 3 baselines. Throttled to
+        // L3_NVS_SAVE_PERIOD_US to keep flash wear negligible.
+        if (now_us - s_l3_last_save_us >= L3_NVS_SAVE_PERIOD_US) {
+            cec_config_save_l3_profiles(g_detect.l3);
+            s_l3_last_save_us = now_us;
+        }
+
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
@@ -342,6 +359,10 @@ static int cmd_show(int argc, char **argv)
     printf("config id=%u supply=%.2f V oc=%.1f A alpha=%.2f raw_telem=%d\n",
            g_config.module_id, g_config.supply_voltage, g_config.oc_threshold_a,
            g_config.ema_alpha, g_config.output_raw);
+    printf("layers L1=%s L2=%s L3=%s\n",
+           g_config.layer1_enabled ? "on" : "off",
+           g_config.layer2_enabled ? "on" : "off",
+           g_config.layer3_enabled ? "on" : "off");
     int decim = cec_capture_get_hs_dump_decimation();
     if (decim > 0) {
         printf("burst  hs_rate=%d Hz/ch dump_decim=%d (~%d Hz visible) cooldown=%d ms\n",
@@ -397,7 +418,7 @@ static int cmd_save(int argc, char **argv)
 static int cmd_set(int argc, char **argv)
 {
     if (argc < 3) {
-        printf("usage: set <alpha|oc|supply> <value>\n");
+        printf("usage: set <alpha|oc|supply|decim|layer1|layer2|layer3> <value|on|off>\n");
         return 1;
     }
     float v = strtof(argv[2], NULL);
@@ -429,6 +450,19 @@ static int cmd_set(int argc, char **argv)
                EPS_BURST_HS_RATE_HZ,
                EPS_BURST_HS_RATE_HZ / cec_capture_get_hs_dump_decimation());
         return 0;   // runtime-only, not persisted
+    } else if (strcmp(argv[1], "layer1") == 0 ||
+               strcmp(argv[1], "layer2") == 0 ||
+               strcmp(argv[1], "layer3") == 0) {
+        int layer = argv[1][5] - '0';
+        bool on;
+        if      (strcmp(argv[2], "on")  == 0) on = true;
+        else if (strcmp(argv[2], "off") == 0) on = false;
+        else { printf("usage: set layer%d <on|off>\n", layer); return 1; }
+        cec_detection_set_layer_enabled(&g_detect, layer, on);
+        if (layer == 1) g_config.layer1_enabled = on;
+        if (layer == 2) g_config.layer2_enabled = on;
+        if (layer == 3) g_config.layer3_enabled = on;
+        printf("layer%d=%s\n", layer, on ? "on" : "off");
     } else {
         printf("error: unknown key '%s'\n", argv[1]);
         return 1;
@@ -594,6 +628,20 @@ void app_main(void)
 
     // Detection
     cec_detection_init(&g_detect, g_config.oc_threshold_a);
+    cec_detection_set_layer_enabled(&g_detect, 1, g_config.layer1_enabled);
+    cec_detection_set_layer_enabled(&g_detect, 2, g_config.layer2_enabled);
+    cec_detection_set_layer_enabled(&g_detect, 3, g_config.layer3_enabled);
+
+    // Load any previously-learned Layer 3 baselines from NVS so the
+    // warm-up window doesn't restart on every reboot.
+    {
+        cec_rail_profile_t profiles[CEC_NUM_CABLES];
+        if (cec_config_load_l3_profiles(profiles)) {
+            for (int i = 0; i < CEC_NUM_CABLES; i++) {
+                g_detect.l3[i] = profiles[i];
+            }
+        }
+    }
 
     // Burst capture engine: pre-trigger ring at SAMPLE_RATE_HZ, HS path
     // at 10 kHz/channel via adc_continuous. Channel conversion params
