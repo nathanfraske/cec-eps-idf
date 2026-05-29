@@ -1,8 +1,16 @@
 # CEC EPS Module — Firmware Specification
 
-Firmware reference for the dual-EPS current monitoring module in the Critical Error Computing (CEC) PC power monitoring platform. This document contains everything needed to start firmware development for the EPS module prototype.
+Firmware reference and architecture overview for the dual-EPS current monitoring module in the Critical Error Computing (CEC) PC power monitoring platform.
 
-> **Status:** Hardware prototype in bring-up. Firmware not yet started. This spec is the starting point.
+> **Status:** Running on prototype hardware. Current + 12 V bus voltage + board temperature telemetry over a CH340K UART (TelePlot), layered anomaly detection with auto-triggered 10 kHz burst capture, NVS-persisted calibration and learned baselines, serial CLI, and CAN/TWAI in bench loopback. Remaining production flips (CAN bitrate/mode, transceiver high-speed mode) are tracked in `FOLLOWUPS.md`.
+
+### Companion documents (maintained every revision)
+
+- **`README.md`** (this file) — comprehensive architecture + hardware + protocol spec. The "what and how it works."
+- **`CLAUDE.md`** — working context for a future agent: build/flash reality, runtime architecture, the 24-pin parity discipline, and a catalogue of ESP-IDF 6.x gotchas. Read it first if you're picking this up.
+- **`FOLLOWUPS.md`** — running lint/cleanup + deferred-feature + cross-repo-parity tracker. The "known about it, not now" list.
+
+Keep all three current: behavior changes → update this README; deferred work → log in `FOLLOWUPS.md`; anything a future agent would waste time rediscovering → add to `CLAUDE.md`.
 
 ---
 
@@ -316,43 +324,48 @@ The EPS firmware reuses the component-based ESP-IDF structure from the 24-pin mo
 ```
 cec-eps-idf/
 ├── CMakeLists.txt
-├── sdkconfig
+├── sdkconfig.defaults
+├── partitions.csv
 ├── main/
 │   ├── CMakeLists.txt
-│   └── eps_main.c
+│   ├── eps_main.c          # app_main, tasks, CLI handlers, detector glue
+│   └── cec_config.{c,h}    # NVS-backed config + L3 profile persistence
 └── components/
-    ├── cec_sensors/        # ACS758 ADC driver (replaces INA226 for EPS)
-    │   ├── acs758.c
-    │   ├── acs758.h
-    │   ├── ntc.c
-    │   └── ntc.h
-    ├── cec_detection/      # shared with 24-pin: state classifier, anomaly layers
-    │   ├── detection.c
-    │   └── detection.h
-    ├── cec_filter/         # shared: median + EMA filters
-    │   ├── filter.c
-    │   └── filter.h
-    ├── cec_capture/        # shared: PSRAM ring buffer for burst capture
-    │   ├── capture.c
-    │   └── capture.h
-    ├── cec_comms/          # shared: CAN/TWAI driver + frame definitions
-    │   ├── can.c
-    │   └── can.h
-    └── cec_output/         # shared: Teleplot serial output
-        ├── teleplot.c
-        └── teleplot.h
+    ├── cec_common/         # shared types: cec_state.h (state, config, enums, flags, triggers)
+    │   └── include/cec_state.h
+    ├── cec_sensors/        # ACS758 current + NTC temp drivers over a shared ADC1 wrapper
+    │   ├── cec_adc.c       #   ADC1 oneshot + curve-fit cali, pause/resume for DMA hand-off
+    │   ├── acs758.c        #   Hall current driver (EPS-specific; replaces INA226)
+    │   └── ntc.c           #   thermistor driver
+    ├── cec_filters/        # shared: ema_t + median_t primitives (caller-owned buffers)
+    │   └── cec_filters.c
+    ├── cec_detection/      # shared layout: cec_layer1/2/3, cec_swing, cec_classifier
+    │   └── cec_detection.c #   + orchestrator that folds layers into flags + load state
+    ├── cec_capture/        # PSRAM pre-trigger ring + 10 kHz adc_continuous HS burst + dump
+    │   └── cec_capture.c
+    ├── cec_comms/          # CAN/TWAI via the esp_twai node-handle API + frame definitions
+    │   └── cec_can.c
+    ├── cec_nvs/            # shared: NVS wrapper with magic-prefixed schema versioning
+    │   └── cec_nvs.c
+    ├── cec_telemetry/      # shared: TelePlot output + UART-transport hand-off
+    │   └── cec_teleplot.c
+    └── cec_cli/            # shared: line-based serial command dispatcher
+        └── cec_cli.c
 ```
 
-The `cec_detection`, `cec_filter`, `cec_capture`, `cec_comms`, and `cec_output` components are shared with the 24-pin module. Only `cec_sensors` differs (ACS758 ADC driver vs INA226 I2C driver).
+`cec_filters`, `cec_nvs`, `cec_cli`, `cec_telemetry`, `cec_swing`, the capture trigger system, and the `cec_rail_profile_t` primitive are shared (byte-for-byte where practical) with the 24-pin module. `cec_sensors` is EPS-specific (ACS758 analog ADC vs INA226 I²C), and the per-layer detection *algorithms* and capture HS path diverge by design — see [Codebase Parity](#codebase-parity-with-the-24-pin-module). `CLAUDE.md` documents the parity discipline in full.
 
 ### FreeRTOS Tasks
 
 | Task | Priority | Rate | Core | Purpose |
 |---|---|---|---|---|
-| sample_task | 5 | 50 Hz (steady) | 0 | Read both ADC channels, convert, filter, push to detection |
-| burst_task | 7 | event-driven | 0 | High-rate capture (1 kHz+) into ring buffer on trigger |
-| output_task | 3 | 10 Hz | 1 | Teleplot serial telemetry |
-| comms_task | 4 | 20 Hz | 1 | CAN frame TX/RX to Hub |
+| sample_task | 5 | 50 Hz | 0 | Read ADC channels, convert, filter, run detection, update state, push capture ring, fire auto-triggers |
+| output_task | 3 | 10 Hz | 1 | TelePlot telemetry (via UART transport) |
+| comms_task | 4 | 20 Hz | 1 | CAN telemetry + anomaly frames (only when `CEC_CAN_ENABLED`) |
+| cec_burst (dispatcher) | max−2, drops to 1 during dump | event-driven | 1 | Runs the 10 kHz `adc_continuous` HS capture + TelePlot dump on trigger |
+| cec_cli reader | 3 | on-demand | any | Line-based serial command parsing |
+
+Burst capture is a dedicated dispatcher task woken by a trigger semaphore (not the originally-sketched `burst_task` polling model). It borrows ADC1 from the oneshot driver for the DMA window, then returns it; `sample_task` skips ADC work while `cec_capture_is_busy()`.
 | command_task | 2 | on-demand | 1 | Serial command parsing |
 
 Sample task pinned to core 0 (isolated from WiFi/comms jitter). Output and comms on core 1.
