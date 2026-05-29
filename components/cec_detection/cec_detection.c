@@ -8,9 +8,28 @@
  *   cec_classifier - load-state classifier
  *
  * Layer 3 z-score (|z| > LAYER3_Z_THRESHOLD) folds into
- * CEC_FLAG_ANOMALY so a sustained drift from the learned baseline
- * fires a burst with reason CEC_TRIG_ANOMALY. The classifier still
- * pulls std_dev as a noise gauge.
+ * CEC_FLAG_ANOMALY after LAYER3_REQUIRED consecutive over-threshold
+ * samples (debounce, mirroring cec_layer1's crit_required). The
+ * classifier still pulls std_dev as a noise gauge.
+ *
+ * Adapt coupling: the rail profile is FROZEN (not updated toward the
+ * sample) while a warm sample is over threshold. Without this, a
+ * sustained transient slowly drags the learned mean toward the bad
+ * value, which pulls |z| back under threshold and produces the
+ * on/off/on/off flag chatter seen on the bench - and would also let
+ * the mean catch up fast enough to defeat the debounce. Freezing
+ * during the anomaly keeps |z| solidly above threshold so the
+ * debounce latches once and the flag stays cleanly asserted for the
+ * duration. This mirrors the 24-pin cec_layer2's documented "variance
+ * estimator only updates on calm samples" behavior.
+ *
+ * Tradeoff: EPS has one profile per cable (no per-(state,rail) profile
+ * bank like the 24-pin), so a genuinely sustained shift to a new
+ * operating level keeps ANOMALY asserted rather than relearning it as
+ * the new normal. The burst cooldown throttles captures to one per
+ * window regardless, and the load classifier separately reports the
+ * magnitude bucket. Per-load-state profiles (relearn after a
+ * sustained shift) are a deferred enhancement.
  */
 
 #include <math.h>
@@ -21,11 +40,18 @@
 #define LAYER1_DROPOUT_FLOOR_A      0.5f
 #define LAYER2_THRESHOLD_A_PER_MS   1.0f
 /* Layer 3 adapt rate. 0.0005 at 50 Hz gives a ~2000-sample (40 s)
- * effective averaging window once warm, matching the 24-pin's value. */
+ * effective averaging window once warm, matching the 24-pin's value.
+ * Kept at this value: with the adapt-coupling freeze + debounce below,
+ * the slow rate no longer causes false-positive chatter, so there's no
+ * need to widen the z threshold or speed up adaptation. */
 #define LAYER3_ADAPT_RATE           0.0005f
 /* z-score threshold. The 24-pin's v0.5.9 uses 4.0 - a >4 sigma
  * deviation from learned-normal is the anomaly trigger. */
 #define LAYER3_Z_THRESHOLD          4.0f
+/* Consecutive over-threshold samples before CEC_FLAG_ANOMALY asserts.
+ * 3 matches cec_layer1's crit_required; at 50 Hz that's a 60 ms
+ * sustain, enough to reject single-sample z spikes. */
+#define LAYER3_REQUIRED             3
 
 void cec_detection_init(cec_detection_ctx_t *ctx, float oc_threshold_a)
 {
@@ -36,6 +62,7 @@ void cec_detection_init(cec_detection_ctx_t *ctx, float oc_threshold_a)
                         LAYER1_CRIT_REQUIRED);
         cec_layer2_init(&ctx->l2[i], LAYER2_THRESHOLD_A_PER_MS);
         cec_rail_profile_init(&ctx->l3[i]);
+        ctx->l3_consecutive[i] = 0;
     }
     ctx->layer1_enabled = true;
     ctx->layer2_enabled = true;
@@ -82,13 +109,31 @@ bool cec_detection_run(cec_detection_ctx_t *ctx,
             flags |= CEC_FLAG_SWING;
         }
 
-        /* Layer 3: rail profile. Update unconditionally so the baseline
-         * keeps tracking even with the layer's flag contribution gated;
-         * a runtime disable just stops the z-score from triggering a
-         * burst, it doesn't freeze the learned mean/std. */
-        cec_rail_profile_update(&ctx->l3[i], current_filt[i], LAYER3_ADAPT_RATE);
+        /* Layer 3: rail profile + debounced z-score.
+         *
+         * z is measured against the CURRENT (pre-update) baseline.
+         * Before warm, z_score returns 0 so z_over is false and the
+         * profile adapts normally through the warm-up window. */
         float z = cec_rail_profile_z_score(&ctx->l3[i], current_filt[i]);
-        if (ctx->layer3_enabled && fabsf(z) > LAYER3_Z_THRESHOLD) {
+        bool z_over = fabsf(z) > LAYER3_Z_THRESHOLD;
+
+        /* Debounce counter (saturating). Resets the moment the sample
+         * is calm so a brief excursion never reaches LAYER3_REQUIRED. */
+        if (z_over) {
+            if (ctx->l3_consecutive[i] < LAYER3_REQUIRED) ctx->l3_consecutive[i]++;
+        } else {
+            ctx->l3_consecutive[i] = 0;
+        }
+
+        /* Adapt coupling: freeze the profile while a (warm) sample is
+         * over threshold so the anomaly can't drag the baseline toward
+         * itself. When the layer is disabled, adapt unconditionally so
+         * the baseline stays current for a later re-enable. */
+        if (!ctx->layer3_enabled || !z_over) {
+            cec_rail_profile_update(&ctx->l3[i], current_filt[i], LAYER3_ADAPT_RATE);
+        }
+
+        if (ctx->layer3_enabled && ctx->l3_consecutive[i] >= LAYER3_REQUIRED) {
             flags |= CEC_FLAG_ANOMALY;
         }
 

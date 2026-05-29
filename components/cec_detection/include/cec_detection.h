@@ -31,6 +31,10 @@ typedef struct {
     cec_layer2_detector_t l2[CEC_NUM_CABLES];   /* fast transient (dI/dt) */
     cec_rail_profile_t    l3[CEC_NUM_CABLES];   /* mean+std rail profile */
 
+    /* Layer 3 debounce: consecutive samples where |z| > threshold per
+     * cable. Internal; cec_detection_run owns the increment/reset. */
+    int l3_consecutive[CEC_NUM_CABLES];
+
     /* Runtime layer enables. Default true on init; flip via
      * cec_detection_set_layer_enabled. A disabled layer is updated but
      * never contributes flags. */
