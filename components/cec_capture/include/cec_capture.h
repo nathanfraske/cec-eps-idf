@@ -27,20 +27,31 @@
  * ESP_ERR_INVALID_STATE; the main sample task is expected to skip
  * ADC-touching work while cec_capture_is_busy() is true.
  *
- * TelePlot dump format (matches the 24-pin envelope):
+ * TelePlot dump format:
  *
+ *   >burst_begin:<ts_ms>:<reason_int>    (numeric, CSV-friendly)
  *   >BURST_BEGIN:<reason>:<n_pre>_normal+<n_hs>_hs:<state>
  *   >BURST_ANNOTATION:<text>            (optional, only if trigger_with_text)
  *   >b_eps1_a:<ts_ms>:<value>           (pre-trigger samples, 50 Hz)
  *   >b_eps2_a:<ts_ms>:<value>
  *   >b_eps1_raw_a:<ts_ms>:<value>
  *   >b_eps2_raw_a:<ts_ms>:<value>
+ *   >b_bus_v:<ts_ms>:<value>
  *   >b_temp_c:<ts_ms>:<value>
  *   >b_load:<ts_ms>:<value>
  *   >b_flags:<ts_ms>:<value>
  *   >hs_eps1_a:<ts_us_offset>:<value>   (HS samples, 10 kHz)
  *   >hs_eps2_a:<ts_us_offset>:<value>
+ *   >burst_end:<ts_ms>:0                 (numeric, CSV-friendly)
  *   >BURST_END
+ *
+ * The lowercase >burst_begin / >burst_end lines carry numeric values
+ * (reason_int from cec_trigger_t for begin, 0 for end) so they survive
+ * TelePlot's CSV export and produce step pulses that bracket each burst
+ * in CSV analysis. The uppercase >BURST_BEGIN / >BURST_ANNOTATION /
+ * >BURST_END lines are kept for raw-stream consumption (idf.py monitor
+ * and the 24-pin's capture-analysis tooling that already parses that
+ * format).
  */
 
 #pragma once
@@ -55,23 +66,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* Trigger sources. Names match the 24-pin's cec_trigger_t. Not every
- * source is wired on EPS yet (e.g. there's no STATE_CHANGE detector
- * here), but the enum is the shared cross-module vocabulary. */
-typedef enum {
-    CEC_TRIG_NONE = 0,
-    CEC_TRIG_MANUAL,
-    CEC_TRIG_STATIC_WARN,
-    CEC_TRIG_STATIC_CRIT,
-    CEC_TRIG_TRANSIENT,
-    CEC_TRIG_ANOMALY,
-    CEC_TRIG_STATE_CHANGE,
-    CEC_TRIG_SHUTDOWN,
-    CEC_TRIG_POWER_SWING,
-    CEC_TRIG_CURRENT_SWING,
-    CEC_TRIG_COUNT,
-} cec_trigger_t;
 
 /* Pre-trigger sample - 50 Hz, full state snapshot. */
 typedef struct {

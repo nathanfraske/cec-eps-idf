@@ -66,6 +66,18 @@ static cec_detection_ctx_t g_detect;
 // visible from 10 kHz captured). Override via `set decim <N>`.
 #define EPS_BURST_HS_DUMP_DECIM     5
 
+// Bus voltage shutdown detector. 1 s rolling window of bus_voltage
+// samples; if (newest - oldest) drops faster than the threshold the
+// rail is collapsing - fire CEC_TRIG_SHUTDOWN (cooldown-bypassed) so
+// the rail's full collapse is captured. After firing, mute the normal
+// anomaly triggers for SHUTDOWN_MUTE_MS so cascading layer fires from
+// the collapsing rail don't spam the dump path. Parity with the
+// 24-pin's v0.5.9 v_12v rate detector.
+#define BUS_V_HIST_SIZE              SAMPLE_RATE_HZ      // 1 sec window
+#define BUS_V_SHUTDOWN_RATE_V_PER_S  (-0.5f)             // V/s, negative
+#define BUS_V_ARMED_THRESHOLD_V       5.0f               // arm once seen above
+#define SHUTDOWN_MUTE_MS              30000              // 30 s mute window
+
 // Telemetry transport - hybrid setup on the Lonely Binary N16R8 board.
 // UART USB-C (CH340K bridge) carries TelePlot output (steady telemetry
 // + burst dumps). JTAG USB-C carries CLI input / ESP_LOG / banners.
@@ -95,6 +107,72 @@ static cec_detection_ctx_t g_detect;
 #define OUTPUT_PERIOD_MS  (1000 / OUTPUT_RATE_HZ)
 #define COMMS_RATE_HZ    20
 #define COMMS_PERIOD_MS   (1000 / COMMS_RATE_HZ)
+
+// ---- Bus voltage shutdown detector helpers ----
+//
+// Rolling 1 s window of bus voltage. The detector arms once the bus
+// has been observed above BUS_V_ARMED_THRESHOLD_V (so cold-boot
+// pre-PSU-up doesn't fire) and disarms after a shutdown fires (so a
+// fully-collapsed rail doesn't re-fire on every iteration).
+// bus_shutdown_muted() gates the normal anomaly trigger path during
+// the post-shutdown window.
+
+static float    s_bus_v_hist[BUS_V_HIST_SIZE];
+static size_t   s_bus_v_hist_idx = 0;
+static size_t   s_bus_v_hist_count = 0;
+static bool     s_bus_shutdown_armed = false;
+static int64_t  s_bus_shutdown_mute_until_us = 0;
+
+static bool bus_shutdown_check(float bus_v, int64_t now_us)
+{
+    s_bus_v_hist[s_bus_v_hist_idx] = bus_v;
+    s_bus_v_hist_idx = (s_bus_v_hist_idx + 1) % BUS_V_HIST_SIZE;
+    if (s_bus_v_hist_count < BUS_V_HIST_SIZE) {
+        s_bus_v_hist_count++;
+        return false;   // need a full window before slope is meaningful
+    }
+
+    if (bus_v >= BUS_V_ARMED_THRESHOLD_V) {
+        s_bus_shutdown_armed = true;
+    }
+    if (!s_bus_shutdown_armed) return false;
+
+    /* idx now points at the about-to-be-overwritten oldest sample. */
+    float oldest = s_bus_v_hist[s_bus_v_hist_idx];
+    float slope_v_per_s = bus_v - oldest;  // window is exactly 1 s wide
+
+    if (slope_v_per_s < BUS_V_SHUTDOWN_RATE_V_PER_S) {
+        s_bus_shutdown_armed = false;  // disarm; re-arms when bus recovers above threshold
+        s_bus_shutdown_mute_until_us = now_us + (int64_t)SHUTDOWN_MUTE_MS * 1000;
+        return true;
+    }
+    return false;
+}
+
+static bool bus_shutdown_muted(int64_t now_us)
+{
+    return now_us < s_bus_shutdown_mute_until_us;
+}
+
+// ---- Load-state edge tracking ----
+//
+// Fires CEC_TRIG_STATE_CHANGE on any transition between load buckets
+// (IDLE/LIGHT/MODERATE/HEAVY/TRANSIENT). cec_capture's cooldown gate
+// throttles back-to-back transitions, so a rapidly fluctuating load
+// produces one burst per cooldown window, not one per transition.
+
+static bool             s_load_state_initialized = false;
+static cec_load_state_t s_prev_load_state;
+
+// ---- Layer 3 NVS persistence cadence ----
+//
+// Snapshot the per-cable rail profiles to NVS every L3_NVS_SAVE_PERIOD
+// so the learned baseline survives reboots. 5 min is the 24-pin's
+// v0.5.9 cadence; the writes are small (one blob of CEC_NUM_CABLES *
+// sizeof(cec_rail_profile_t) bytes) so the NVS wear is negligible.
+
+#define L3_NVS_SAVE_PERIOD_US  (5LL * 60 * 1000 * 1000)
+static int64_t s_l3_last_save_us = 0;
 
 // ---- Sample task: read, convert, filter, detect, store ----
 static void sample_task(void *arg)
@@ -132,6 +210,16 @@ static void sample_task(void *arg)
         float bus_v = 0.0f;
         (void)cec_adc_read(&s_rail_12v, &bus_v); // leaves at 0 on failure
 
+        // Bus voltage shutdown detection. Bypasses cooldown so the
+        // collapse is always captured even if a recent burst is in
+        // cooldown. Also arms the post-shutdown mute window that
+        // suppresses normal anomaly triggers from the cascading rail.
+        if (bus_shutdown_check(bus_v, now_us)) {
+            esp_err_t tr = cec_capture_trigger(CEC_TRIG_SHUTDOWN);
+            ESP_LOGW(TAG, "bus shutdown detected (bus=%.2fV) - burst (%s) mute=%dms",
+                     bus_v, esp_err_to_name(tr), SHUTDOWN_MUTE_MS);
+        }
+
         // Update shared state
         if (xSemaphoreTake(g_state.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             for (int i = 0; i < CEC_NUM_CABLES; i++) {
@@ -160,19 +248,52 @@ static void sample_task(void *arg)
         };
         cec_capture_push(&cap_sample);
 
-        if (anomaly) {
-            // Fire a burst capture on anomaly. cec_capture's busy/cooldown
-            // gates absorb back-to-back triggers; we don't gate again here.
-            esp_err_t tr = cec_capture_trigger(CEC_TRIG_ANOMALY);
+        if (anomaly && !bus_shutdown_muted(now_us)) {
+            // Fire a burst capture on anomaly with the trigger reason
+            // picked from the actual flags (so the burst envelope reads
+            // STATIC_CRIT / ANOMALY / CURRENT_SWING rather than always
+            // ANOMALY). cec_capture's busy/cooldown gates absorb
+            // back-to-back triggers; we don't gate again here. The
+            // shutdown-mute test silences cascading detector fires
+            // from a collapsing rail in the 30 s after SHUTDOWN.
+            cec_trigger_t reason = cec_trigger_for_flags(flags);
+            esp_err_t tr = cec_capture_trigger(reason);
             if (tr == ESP_OK) {
-                ESP_LOGW(TAG, "anomaly flags=0x%02x - burst triggered", flags);
+                ESP_LOGW(TAG, "flags=0x%02x reason=%s - burst triggered",
+                         flags, cec_trigger_name(reason));
             } else if (tr == ESP_ERR_NOT_FINISHED || tr == ESP_ERR_INVALID_STATE) {
-                ESP_LOGD(TAG, "anomaly flags=0x%02x - burst skipped (%s)",
-                         flags, esp_err_to_name(tr));
+                ESP_LOGD(TAG, "flags=0x%02x reason=%s - burst skipped (%s)",
+                         flags, cec_trigger_name(reason), esp_err_to_name(tr));
             } else {
-                ESP_LOGW(TAG, "anomaly flags=0x%02x - trigger failed: %s",
-                         flags, esp_err_to_name(tr));
+                ESP_LOGW(TAG, "flags=0x%02x reason=%s - trigger failed: %s",
+                         flags, cec_trigger_name(reason), esp_err_to_name(tr));
             }
+        }
+
+        // Load state transition trigger. Cooldown gate on cec_capture
+        // throttles rapid back-to-back transitions to one burst per
+        // cooldown window, which is what we want for steady-state CPU
+        // load chatter. Suppressed during the shutdown mute window.
+        if (s_load_state_initialized
+            && load_state != s_prev_load_state
+            && !bus_shutdown_muted(now_us)) {
+            char ann[40];
+            snprintf(ann, sizeof(ann), "load %s -> %s",
+                     cec_load_state_name(s_prev_load_state),
+                     cec_load_state_name(load_state));
+            esp_err_t tr = cec_capture_trigger_with_text(CEC_TRIG_STATE_CHANGE, ann);
+            if (tr == ESP_OK) {
+                ESP_LOGI(TAG, "state change: %s", ann);
+            }
+        }
+        s_prev_load_state = load_state;
+        s_load_state_initialized = true;
+
+        // Periodic NVS snapshot of the Layer 3 baselines. Throttled to
+        // L3_NVS_SAVE_PERIOD_US to keep flash wear negligible.
+        if (now_us - s_l3_last_save_us >= L3_NVS_SAVE_PERIOD_US) {
+            cec_config_save_l3_profiles(g_detect.l3);
+            s_l3_last_save_us = now_us;
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
@@ -238,6 +359,10 @@ static int cmd_show(int argc, char **argv)
     printf("config id=%u supply=%.2f V oc=%.1f A alpha=%.2f raw_telem=%d\n",
            g_config.module_id, g_config.supply_voltage, g_config.oc_threshold_a,
            g_config.ema_alpha, g_config.output_raw);
+    printf("layers L1=%s L2=%s L3=%s\n",
+           g_config.layer1_enabled ? "on" : "off",
+           g_config.layer2_enabled ? "on" : "off",
+           g_config.layer3_enabled ? "on" : "off");
     int decim = cec_capture_get_hs_dump_decimation();
     if (decim > 0) {
         printf("burst  hs_rate=%d Hz/ch dump_decim=%d (~%d Hz visible) cooldown=%d ms\n",
@@ -293,7 +418,7 @@ static int cmd_save(int argc, char **argv)
 static int cmd_set(int argc, char **argv)
 {
     if (argc < 3) {
-        printf("usage: set <alpha|oc|supply> <value>\n");
+        printf("usage: set <alpha|oc|supply|decim|layer1|layer2|layer3> <value|on|off>\n");
         return 1;
     }
     float v = strtof(argv[2], NULL);
@@ -325,6 +450,19 @@ static int cmd_set(int argc, char **argv)
                EPS_BURST_HS_RATE_HZ,
                EPS_BURST_HS_RATE_HZ / cec_capture_get_hs_dump_decimation());
         return 0;   // runtime-only, not persisted
+    } else if (strcmp(argv[1], "layer1") == 0 ||
+               strcmp(argv[1], "layer2") == 0 ||
+               strcmp(argv[1], "layer3") == 0) {
+        int layer = argv[1][5] - '0';
+        bool on;
+        if      (strcmp(argv[2], "on")  == 0) on = true;
+        else if (strcmp(argv[2], "off") == 0) on = false;
+        else { printf("usage: set layer%d <on|off>\n", layer); return 1; }
+        cec_detection_set_layer_enabled(&g_detect, layer, on);
+        if (layer == 1) g_config.layer1_enabled = on;
+        if (layer == 2) g_config.layer2_enabled = on;
+        if (layer == 3) g_config.layer3_enabled = on;
+        printf("layer%d=%s\n", layer, on ? "on" : "off");
     } else {
         printf("error: unknown key '%s'\n", argv[1]);
         return 1;
@@ -399,7 +537,7 @@ static int cmd_mode(int argc, char **argv)
 static const cec_cli_command_t CLI_COMMANDS[] = {
     { "show",  "print current readings, calibration, and config",       cmd_show  },
     { "cal",   "zero-offset cal on both sensors, or 'cal span <amps>'", cmd_cal   },
-    { "set",   "set <alpha|oc|supply|decim> <value> (decim is runtime-only)", cmd_set },
+    { "set",   "set <alpha|oc|supply|decim|layer1|layer2|layer3> <val>",     cmd_set },
     { "save",  "persist current config to NVS",                         cmd_save  },
     { "mode",  "set telemetry mode: 'mode raw' or 'mode filt'",         cmd_mode  },
     { "burst", "trigger a manual burst capture ('burst <annotation>')", cmd_burst },
@@ -490,6 +628,20 @@ void app_main(void)
 
     // Detection
     cec_detection_init(&g_detect, g_config.oc_threshold_a);
+    cec_detection_set_layer_enabled(&g_detect, 1, g_config.layer1_enabled);
+    cec_detection_set_layer_enabled(&g_detect, 2, g_config.layer2_enabled);
+    cec_detection_set_layer_enabled(&g_detect, 3, g_config.layer3_enabled);
+
+    // Load any previously-learned Layer 3 baselines from NVS so the
+    // warm-up window doesn't restart on every reboot.
+    {
+        cec_rail_profile_t profiles[CEC_NUM_CABLES];
+        if (cec_config_load_l3_profiles(profiles)) {
+            for (int i = 0; i < CEC_NUM_CABLES; i++) {
+                g_detect.l3[i] = profiles[i];
+            }
+        }
+    }
 
     // Burst capture engine: pre-trigger ring at SAMPLE_RATE_HZ, HS path
     // at 10 kHz/channel via adc_continuous. Channel conversion params
